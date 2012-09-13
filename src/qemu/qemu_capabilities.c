@@ -253,8 +253,8 @@ static const struct qemu_feature_flags const arch_info_x86_64_flags [] = {
 
 /* The archicture tables for supported QEMU archs */
 static const struct qemu_arch_info const arch_info_hvm[] = {
-    {  "i686",   32, NULL, "qemu",
-       "qemu-system-x86_64", arch_info_i686_flags, 4 },
+    {  "i686",   32, NULL, "qemu-system-i386",
+       NULL, arch_info_i686_flags, 4 },
     {  "x86_64", 64, NULL, "qemu-system-x86_64",
        NULL, arch_info_x86_64_flags, 2 },
     {  "arm",    32, NULL, "qemu-system-arm",    NULL, NULL, 0 },
