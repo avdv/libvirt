@@ -1319,6 +1319,7 @@ virConsoleOpen;
 
 # virdbus.h
 virDBusGetSystemBus;
+virDBusGetSessionBus;
 
 
 # virdomainlist.h
