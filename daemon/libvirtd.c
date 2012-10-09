@@ -98,6 +98,11 @@
 
 #include "configmake.h"
 
+#ifdef HAVE_DBUS
+# include <dbus/dbus.h>
+# include "virdbus.h"
+#endif
+
 #if HAVE_SASL
 virNetSASLContextPtr saslCtxt = NULL;
 #endif
@@ -755,6 +760,212 @@ static int daemonSetupSignals(virNetServerPtr srv)
     return 0;
 }
 
+#ifdef HAVE_DBUS
+
+static DBusConnection *sessionBus;
+static DBusConnection *systemBus;
+static virConnectPtr sessionConnection;
+static int numActiveDomains;
+static bool hasInhibit;
+static bool callingInhibit;
+static int inhibitFd = -1;
+
+static void runSaveAllDomains(void *opaque)
+{
+    virNetServerPtr srv = opaque;
+    int numDomains, i;
+    int state;
+    virDomainPtr *domains = NULL;
+    unsigned int *flags = NULL;
+
+    numDomains = virConnectListAllDomains(sessionConnection, &domains,  VIR_CONNECT_LIST_DOMAINS_ACTIVE);
+    if (numDomains < 0)
+        goto cleanup;
+
+    if (VIR_ALLOC_N(flags, numDomains) < 0) {
+        virReportOOMError();
+        goto cleanup;
+    }
+
+    /* First we pause all VMs to make them stop dirtying
+       pages, etc. We remember if any VMs were paused so
+       we can restore that on resume. */
+    for (i = 0 ; i < numDomains ; i++) {
+        flags[i] = VIR_DOMAIN_SAVE_RUNNING;
+        if (virDomainGetState (domains[i], &state, NULL, 0) == 0) {
+            if (state == VIR_DOMAIN_PAUSED) {
+                flags[i] = VIR_DOMAIN_SAVE_PAUSED;
+            }
+        }
+        virDomainSuspend (domains[i]);
+    }
+
+    /* Then we save the VMs to disk */
+    for (i = 0 ; i < numDomains ; i++)
+        virDomainManagedSave (domains[i], flags[i]);
+
+    VIR_FREE (domains);
+    VIR_FREE (flags);
+
+ cleanup:
+    if (domains != NULL) {
+        for (i = 0 ; i < numDomains ; i++)
+            virDomainFree (domains[i]);
+        VIR_FREE (domains);
+    }
+    if (flags != NULL)
+        VIR_FREE (flags);
+
+    /* We don't need any shutdown inhibit lock anymore now */
+    if (inhibitFd != -1) {
+        if (VIR_CLOSE (inhibitFd) < 0)
+            virReportSystemError(errno, "%s", _("failed to close file"));
+        inhibitFd = -1;
+    }
+
+    /* Exit libvirtd cleanly */
+    virNetServerQuit (srv);
+}
+
+/* We do this in a thread to not block the main loop */
+static void saveAllDomains(virNetServerPtr srv)
+{
+    virThread thr;
+    virObjectRef(srv);
+    if (virThreadCreate(&thr, false, runSaveAllDomains, srv) < 0) {
+        virObjectUnref(srv);
+    }
+}
+
+static void gotInhibitReply (DBusPendingCall *pending,
+                             void            *opaque ATTRIBUTE_UNUSED)
+{
+    DBusMessage *reply;
+    int fd;
+
+    callingInhibit = false;
+
+    reply = dbus_pending_call_steal_reply (pending);
+    if (reply == NULL)
+        return;
+
+    if (dbus_message_get_args (reply, NULL,
+                                DBUS_TYPE_UNIX_FD, &fd,
+                                DBUS_TYPE_INVALID)) {
+        if (hasInhibit)
+            inhibitFd = fd;
+        else {
+            /* We stopped the last VM since we made the inhibit call */
+            if (VIR_CLOSE (fd) < 0) {
+                virReportSystemError(errno, "%s", _("failed to close file"));
+            }
+        }
+    }
+    dbus_message_unref (reply);
+}
+
+/* As per: http://www.freedesktop.org/wiki/Software/systemd/inhibit */
+static void callInhibit(const char *what,
+                        const char *who,
+                        const char *why,
+                        const char *mode)
+{
+    DBusMessage *message;
+    DBusPendingCall *pendingReply;
+
+    if (systemBus == NULL)
+        return;
+
+    /* Only one outstanding call at a time */
+    if (callingInhibit)
+        return;
+
+    message = dbus_message_new_method_call ("org.freedesktop.login1",
+                                            "/org/freedesktop/login1",
+                                            "org.freedesktop.login1.Manager",
+                                            "Inhibit");
+    if (message == NULL)
+        return;
+
+    dbus_message_append_args (message,
+                              DBUS_TYPE_STRING, &what,
+                              DBUS_TYPE_STRING, &who,
+                              DBUS_TYPE_STRING, &why,
+                              DBUS_TYPE_STRING, &mode,
+                              DBUS_TYPE_INVALID);
+
+    pendingReply = NULL;
+    if (dbus_connection_send_with_reply (systemBus, message,
+                                         &pendingReply,
+                                         25*1000)) {
+        dbus_pending_call_set_notify (pendingReply,
+                                      gotInhibitReply,
+                                      NULL, NULL);
+        callingInhibit = true;
+    }
+    dbus_message_unref (message);
+}
+
+
+static void numActiveDomainsChanged(void)
+{
+    if (numActiveDomains > 0 && !hasInhibit) {
+        callInhibit("shutdown", _("Libvirt"), _("Virtual machines need to be saved"), "delay");
+        hasInhibit = true;
+    } else if (numActiveDomains == 0 && hasInhibit) {
+        if (inhibitFd != -1) {
+            if (VIR_CLOSE (inhibitFd) < 0) {
+                virReportSystemError(errno, "%s", _("failed to close file"));
+            }
+            inhibitFd = -1;
+        }
+        hasInhibit = false;
+    }
+}
+
+static int lifecycleEventCallback(virConnectPtr conn ATTRIBUTE_UNUSED,
+                                  virDomainPtr dom ATTRIBUTE_UNUSED,
+                                  int event,
+                                  int detail ATTRIBUTE_UNUSED,
+                                  void *opaque ATTRIBUTE_UNUSED)
+{
+    if (event == VIR_DOMAIN_EVENT_STOPPED)
+        numActiveDomains--;
+    else if (event == VIR_DOMAIN_EVENT_STARTED)
+        numActiveDomains++;
+
+    numActiveDomainsChanged();
+
+    return 0;
+}
+
+static DBusHandlerResult handleSessionMessageFunc(DBusConnection  *connection ATTRIBUTE_UNUSED,
+                                                  DBusMessage     *message,
+                                                  void            *userData)
+{
+    virNetServerPtr srv = userData;
+
+    if (dbus_message_is_signal(message, DBUS_INTERFACE_LOCAL, "Disconnected")) {
+        saveAllDomains (srv);
+    }
+
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+static DBusHandlerResult handleSystemMessageFunc(DBusConnection  *connection ATTRIBUTE_UNUSED,
+                                                 DBusMessage     *message,
+                                                 void            *userData)
+{
+    virNetServerPtr srv = userData;
+
+    if (dbus_message_is_signal(message, "org.freedesktop.login1.Manager", "PrepareForShutdown")) {
+        saveAllDomains (srv);
+    }
+
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+#endif
+
 static void daemonRunStateInit(void *opaque)
 {
     virNetServerPtr srv = opaque;
@@ -770,6 +981,39 @@ static void daemonRunStateInit(void *opaque)
         virObjectUnref(srv);
         return;
     }
+
+#ifdef HAVE_DBUS
+    /* Tie the non-priviledged libvirtd to the session/shutdown lifecycle */
+    if (!virNetServerIsPrivileged(srv)) {
+
+        sessionBus = virDBusGetSessionBus ();
+        if (sessionBus != NULL) {
+            dbus_connection_add_filter(sessionBus,
+                                       handleSessionMessageFunc, srv, NULL);
+        }
+
+        systemBus = virDBusGetSystemBus ();
+        if (systemBus != NULL) {
+            dbus_connection_add_filter(systemBus,
+                                       handleSystemMessageFunc, srv, NULL);
+            dbus_bus_add_match(systemBus,
+                               "type='signal',sender='org.freedesktop.login1', interface='org.freedesktop.login1.Manager'",
+                               NULL);
+        }
+
+        sessionConnection = virConnectOpen("qemu:///session");
+        if (sessionConnection != NULL) {
+            numActiveDomains = virConnectNumOfDomains(sessionConnection);
+            virConnectDomainEventRegisterAny(sessionConnection,
+                                             NULL,
+                                             VIR_DOMAIN_EVENT_ID_LIFECYCLE,
+                                             VIR_DOMAIN_EVENT_CALLBACK (lifecycleEventCallback),
+                                             NULL, NULL);
+            numActiveDomainsChanged();
+        }
+
+    }
+#endif
 
     /* Only now accept clients from network */
     virNetServerUpdateServices(srv, true);
